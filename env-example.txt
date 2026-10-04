@@ -7,3 +7,4 @@ NOTION_CARDS_DB=78d60efb27954e97a55a65819fdd0ee3
 ADMIN_CHAT_ID=sizning Telegram ID yoki admin guruh ID
 CLAUDE_MODEL=claude-haiku-4-5-20251001
 TZ=Asia/Tashkent
+ADMIN_USER_ID=sizning Telegram ID (admin guruh ishlatilsa shart)

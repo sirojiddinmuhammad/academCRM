@@ -19,9 +19,16 @@ import re
 from datetime import datetime, timezone, timedelta
 
 import requests
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -45,7 +52,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 TZ = timezone(timedelta(hours=5))
 MAX_CHEK_YOSHI = 30          # kun — bundan eski chek shubhali
-KARTA_MUDDATI = 2 * 60 * 60  # soniya — karta xabari shuncha turadi
+KARTA_MUDDATI = 60 * 60      # soniya — karta xabari shuncha turadi (1 soat)
 
 BTN_TOLOV = "💳 To'lov qilish"
 BTN_TOLOVLARIM = "📋 Mening to'lovlarim"
@@ -68,9 +75,14 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
+ADMIN_USER_ID = int(
+    os.environ.get("ADMIN_USER_ID", ADMIN_CHAT_ID if ADMIN_CHAT_ID > 0 else 0)
+)
+
 student_cache: dict[int, dict] = {}
 write_lock = asyncio.Lock()
 karta_navbat = {"n": 0}  # bir nechta faol karta bo'lsa — navbat bilan ko'rsatish
+sorovlar: dict[str, dict] = {}  # tuzatish so'rovlari: page_id -> ma'lumot
 
 
 # ----------------------------------------------------------------------------
@@ -235,6 +247,30 @@ def ncreate(db_id: str, props: dict) -> dict:
     )
     r.raise_for_status()
     return r.json()
+
+
+def nget(page_id: str) -> dict:
+    r = requests.get(
+        f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION_HEADERS, timeout=30
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def summani_yangilash(page_id: str, yangi_summa: float, kim: str) -> None:
+    """Summani yangilaydi, eski qiymatni Izohga yozib qo'yadi."""
+    page = nget(page_id)
+    p = page["properties"]
+    eski = p.get("Summa", {}).get("number")
+    eski_izoh = txt(p.get("Izoh", {}))
+    qayd = f"summa {money(eski)} dan {money(yangi_summa)} ga o'zgartirildi ({kim})"
+    nupdate(
+        page_id,
+        {
+            "Summa": {"number": yangi_summa},
+            "Izoh": rt(f"{eski_izoh}; {qayd}" if eski_izoh else qayd),
+        },
+    )
 
 
 def nupdate(page_id: str, props: dict) -> dict:
@@ -496,6 +532,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await show_payments(update, context)
         return
 
+    if await tuzatishni_qabul_qilish(update, context, matn):
+        return
+
     if context.user_data.get("kutilmoqda") == "ism":
         if (
             len(matn) < 3
@@ -595,6 +634,7 @@ async def show_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     m3 = await update.message.reply_text(
         "📄 To'lovni amalga oshirgach, chekni shu yerga yuboring.\n\n"
+        "⏳ Chekni 1 soat ichida yuboring — karta raqami o'zgarishi mumkin.\n\n"
         "✅ Eng yaxshisi — bank ilovasidan chekni PDF qilib yuklab, "
         "shu faylni yuborish. Bunda ma'lumotlar aniq o'qiladi.\n"
         "📸 Imkoni bo'lmasa, screenshot ham bo'ladi."
@@ -668,7 +708,8 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not context.user_data.get("chek_kutilmoqda"):
         await message.reply_text(
-            "💳 Avval \"To'lov qilish\" tugmasini bosing, keyin chekni yuboring. 👇",
+            "⏳ Vaqt tugadi — karta raqami eskirgan bo'lishi mumkin.\n\n"
+            "💳 \"To'lov qilish\" tugmasini bosib, yangi kartani oling. 👇",
             reply_markup=MENU,
         )
         return
@@ -770,7 +811,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             }
 
         try:
-            await asyncio.to_thread(ncreate, DB_PAYMENTS, props)
+            page = await asyncio.to_thread(ncreate, DB_PAYMENTS, props)
         except Exception:
             log.exception("Notion yozishda xato")
             await kutish.edit_text(
@@ -793,32 +834,210 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # --- karta xabarlarini o'chirish ---
     await kartani_tozalash(context, chat_id, context.user_data)
 
+    pid = page["id"].replace("-", "")
+
     await kutish.edit_text(
         f"✅ To'lovingiz qabul qilindi!\n\n"
         f"💰 {money(data.get('summa'))} so'm\n"
         f"📅 {sana_matn(data.get('sana'))}\n\n"
-        f"Rahmat! 🌟"
+        f"Rahmat! 🌟\n\n"
+        f"Summa to'g'ri o'qildimi? Agar noto'g'ri bo'lsa, quyidagi tugma orqali "
+        f"to'g'rilab qo'yishingiz mumkin — biz tekshirib tasdiqlaymiz.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Summani o'zgartirish", callback_data=f"t:{pid}")]]
+        ),
     )
 
-    # --- adminga xabar ---
-    if muammolar:
+    # --- adminga hisobot (har bir to'lov) ---
+    try:
+        nik = f" (@{user.username})" if user.username else ""
+        karta_matn = (
+            f"{karta['bank'] or 'karta'} ...{oxirgi4(karta['raqam'])}"
+            if karta
+            else (data.get("qabul_kartasi") or "—")
+        )
+        sarlavha = "⚠️ Yangi to'lov — tekshirish kerak" if muammolar else "✅ Yangi to'lov"
+        matn = (
+            f"{sarlavha}\n\n"
+            f"👤 O'quvchi: {student['ism']}{nik}\n"
+            f"💰 Summa: {money(data.get('summa'))} so'm\n"
+            f"📅 Sana: {sana_matn(data.get('sana'))}\n"
+            f"🏦 Bank: {data.get('bank') or '—'}\n"
+            f"💳 Karta: {karta_matn}"
+        )
+        if data.get("komissiya"):
+            matn += f"\n🧾 Komissiya: {money(data['komissiya'])} so'm"
+        if muammolar:
+            matn += f"\n\n❗️ Sabab: {', '.join(muammolar)}"
+
+        await context.bot.send_message(
+            ADMIN_CHAT_ID,
+            matn,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✏️ Summani o'zgartirish", callback_data=f"a:{pid}"
+                        )
+                    ]
+                ]
+            ),
+        )
+        if message.photo:
+            await context.bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id)
+        elif message.document:
+            await context.bot.send_document(ADMIN_CHAT_ID, message.document.file_id)
+    except Exception:
+        log.exception("Adminga xabar yuborilmadi")
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    amal, _, qolgan = query.data.partition(":")
+
+    # --- talaba: summani o'zgartirmoqchi ---
+    if amal == "t":
+        context.user_data["tuzatish"] = qolgan
+        await query.answer()
+        await query.message.reply_text(
+            "✏️ To'g'ri summani yozing (faqat raqam).\n\n"
+            "Masalan: 450000\n\n"
+            "Bekor qilish uchun: /bekor"
+        )
+        return
+
+    # --- admin: to'g'ridan-to'g'ri tahrir ---
+    if amal == "a":
+        if ADMIN_USER_ID and user.id != ADMIN_USER_ID:
+            await query.answer("Sizda ruxsat yo'q", show_alert=True)
+            return
+        context.user_data["admin_tuzatish"] = qolgan
+        await query.answer()
+        await query.message.reply_text(
+            "✏️ Yangi summani yozing (faqat raqam).\n\nBekor qilish uchun: /bekor"
+        )
+        return
+
+    # --- admin: talaba so'rovini tasdiqlash yoki rad etish ---
+    if amal in ("ok", "no"):
+        if ADMIN_USER_ID and user.id != ADMIN_USER_ID:
+            await query.answer("Sizda ruxsat yo'q", show_alert=True)
+            return
+
+        sorov = sorovlar.pop(qolgan, None)
+        if not sorov:
+            await query.answer("So'rov topilmadi yoki allaqachon hal qilingan", show_alert=True)
+            return
+
+        if amal == "no":
+            await query.answer("Rad etildi")
+            await query.edit_message_text((query.message.text or "") + "\n\n❌ Rad etildi")
+            try:
+                await context.bot.send_message(
+                    sorov["chat_id"],
+                    "❌ Summani o'zgartirish so'rovingiz rad etildi.\n\n"
+                    "Savol bo'lsa, administratorga murojaat qiling.",
+                )
+            except Exception:
+                log.exception("Talabaga xabar yuborilmadi")
+            return
+
         try:
-            nik = f" (@{user.username})" if user.username else ""
+            await asyncio.to_thread(
+                summani_yangilash, sorov["page_id"], sorov["yangi"], "talaba so'rovi"
+            )
+        except Exception as exc:
+            await query.answer(f"Xato: {exc}"[:180], show_alert=True)
+            sorovlar[qolgan] = sorov
+            return
+
+        await query.answer("Tasdiqlandi")
+        await query.edit_message_text((query.message.text or "") + "\n\n✅ Tasdiqlandi")
+        try:
+            await context.bot.send_message(
+                sorov["chat_id"],
+                f"✅ Summa to'g'rilandi: {money(sorov['yangi'])} so'm\n\nRahmat! 🌟",
+            )
+        except Exception:
+            log.exception("Talabaga xabar yuborilmadi")
+
+
+async def tuzatishni_qabul_qilish(update, context, matn: str) -> bool:
+    """Tuzatish rejimidagi matnni qayta ishlaydi. True — matn ishlatildi."""
+    user = update.effective_user
+
+    page_id = context.user_data.get("admin_tuzatish")
+    if page_id:
+        raqam = re.sub(r"\D", "", matn)
+        if not raqam:
+            await update.message.reply_text("Faqat raqam yozing. Masalan: 450000")
+            return True
+        try:
+            await asyncio.to_thread(summani_yangilash, page_id, int(raqam), "admin")
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Yangilab bo'lmadi: {exc}")
+            return True
+        context.user_data.pop("admin_tuzatish", None)
+        await update.message.reply_text(f"✅ Summa yangilandi: {money(int(raqam))} so'm")
+        return True
+
+    page_id = context.user_data.get("tuzatish")
+    if page_id:
+        raqam = re.sub(r"\D", "", matn)
+        if not raqam:
+            await update.message.reply_text(
+                "Faqat raqam yozing. Masalan: 450000\n\nBekor qilish uchun: /bekor"
+            )
+            return True
+
+        student = await asyncio.to_thread(get_student, user.id)
+        try:
+            page = await asyncio.to_thread(nget, page_id)
+            eski = page["properties"].get("Summa", {}).get("number")
+        except Exception:
+            eski = None
+
+        sorovlar[page_id] = {
+            "page_id": page_id,
+            "chat_id": update.effective_chat.id,
+            "yangi": int(raqam),
+        }
+        context.user_data.pop("tuzatish", None)
+
+        await update.message.reply_text(
+            "📨 So'rovingiz yuborildi.\n\n"
+            "Administrator tekshirib tasdiqlagach, sizga xabar beramiz."
+        )
+
+        nik = f" (@{user.username})" if user.username else ""
+        try:
             await context.bot.send_message(
                 ADMIN_CHAT_ID,
-                f"⚠️ Tekshirish kerak\n\n"
-                f"👤 O'quvchi: {student['ism']}{nik}\n"
-                f"💰 Summa: {money(data.get('summa'))} so'm\n"
-                f"📅 Sana: {sana_matn(data.get('sana'))}\n"
-                f"🏦 Bank: {data.get('bank') or '—'}\n\n"
-                f"❗️ Sabab: {', '.join(muammolar)}",
+                f"✏️ Summani tuzatish so'rovi\n\n"
+                f"👤 {student['ism'] if student else user.id}{nik}\n"
+                f"🤖 AI o'qigan: {money(eski)} so'm\n"
+                f"🙋 Talaba aytgan: {money(int(raqam))} so'm",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ok:{page_id}"),
+                            InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{page_id}"),
+                        ]
+                    ]
+                ),
             )
-            if message.photo:
-                await context.bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id)
-            elif message.document:
-                await context.bot.send_document(ADMIN_CHAT_ID, message.document.file_id)
         except Exception:
-            log.exception("Adminga xabar yuborilmadi")
+            log.exception("Adminga so'rov yuborilmadi")
+        return True
+
+    return False
+
+
+async def cmd_bekor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("tuzatish", None)
+    context.user_data.pop("admin_tuzatish", None)
+    await update.message.reply_text("Bekor qilindi.", reply_markup=MENU)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -838,6 +1057,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("bekor", cmd_bekor))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_receipt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
