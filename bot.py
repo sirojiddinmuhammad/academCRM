@@ -70,6 +70,7 @@ NOTION_HEADERS = {
 
 student_cache: dict[int, dict] = {}
 write_lock = asyncio.Lock()
+karta_navbat = {"n": 0}  # bir nechta faol karta bo'lsa — navbat bilan ko'rsatish
 
 
 # ----------------------------------------------------------------------------
@@ -311,20 +312,37 @@ def create_student(tg_id: int, ism: str, username: str, profil: str) -> dict:
 
 def get_cards() -> dict:
     """Kartalarni har safar Notion'dan o'qiydi — kesh yo'q, o'zgarish darhol ko'rinadi."""
-    faol, eski = None, []
+    faol, eski = [], []
     for row in nq(DB_CARDS, limit=50):
         p = row["properties"]
         karta = {
+            "page_id": row["id"],
             "raqam": title_txt(p.get("Karta raqami", {})),
             "egasi": txt(p.get("Egasi", {})),
             "bank": txt(p.get("Bank", {})),
         }
+        if not karta["raqam"]:
+            continue
         holat = (p.get("Holati", {}).get("select") or {}).get("name")
-        if holat == "Faol" and not faol:
-            faol = karta
+        if holat == "Faol":
+            faol.append(karta)
         elif holat == "Eski":
             eski.append(karta)
+
+    # tartib doimiy bo'lishi uchun — navbat to'g'ri aylanishi kerak
+    faol.sort(key=lambda k: k["raqam"])
     return {"faol": faol, "eski": eski}
+
+
+def karta_topish(cards: dict, qabul_raqam: str | None) -> dict | None:
+    """Chekdagi qabul kartasi bazadagi qaysi kartaga mos kelishini topadi."""
+    oxiri = oxirgi4(qabul_raqam)
+    if not oxiri:
+        return None
+    for karta in cards.get("faol", []) + cards.get("eski", []):
+        if oxirgi4(karta["raqam"]) == oxiri:
+            return karta
+    return None
 
 
 def find_duplicate(file_hash: str, tranzaksiya_id: str | None) -> dict | None:
@@ -373,8 +391,8 @@ def izoh_qoshish(page_id: str, eski_izoh: str, qoshimcha: str) -> None:
 # Tekshiruvlar
 # ----------------------------------------------------------------------------
 
-def tekshir(data: dict, tg_id: int) -> tuple[list[str], dict | None]:
-    """(muammolar ro'yxati, bir kundagi takror yozuv)"""
+def tekshir(data: dict, tg_id: int) -> tuple[list[str], dict | None, dict | None]:
+    """(muammolar ro'yxati, bir kundagi takror yozuv, topilgan karta)"""
     muammolar = []
     cards = get_cards()
 
@@ -401,21 +419,19 @@ def tekshir(data: dict, tg_id: int) -> tuple[list[str], dict | None]:
         except ValueError:
             muammolar.append("sana noto'g'ri formatda")
 
+    karta = karta_topish(cards, data.get("qabul_kartasi"))
     qabul = oxirgi4(data.get("qabul_kartasi"))
     if qabul:
-        faol = cards.get("faol")
-        if faol and oxirgi4(faol["raqam"]) == qabul:
-            pass
-        elif any(oxirgi4(k["raqam"]) == qabul for k in cards.get("eski", [])):
-            muammolar.append("eski kartaga to'langan")
-        else:
+        if not karta:
             muammolar.append(f"boshqa kartaga tushgan (...{qabul})")
+        elif karta not in cards.get("faol", []):
+            muammolar.append("eski kartaga to'langan")
 
     takror = bir_kunda_takror(tg_id, data.get("summa"), sana)
     if takror:
         muammolar.append("shu talabadan bugun aynan shu summa allaqachon kelgan")
 
-    return muammolar, takror
+    return muammolar, takror, karta
 
 
 # ----------------------------------------------------------------------------
@@ -553,14 +569,18 @@ async def show_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    faol = cards.get("faol")
-    if not faol or not faol["raqam"]:
+    faol_kartalar = cards.get("faol", [])
+    if not faol_kartalar:
         log.error("Kartalar bazasida 'Faol' karta yo'q!")
         await update.message.reply_text(
             "⚠️ Hozircha to'lov kartasi mavjud emas.\n"
             "Iltimos, administratorga murojaat qiling."
         )
         return
+
+    # navbat bilan: har safar keyingi faol karta
+    faol = faol_kartalar[karta_navbat["n"] % len(faol_kartalar)]
+    karta_navbat["n"] += 1
 
     satrlar = ["💳 To'lov kartasi", ""]
     if faol["egasi"]:
@@ -707,10 +727,10 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
         try:
-            muammolar, takror = await asyncio.to_thread(tekshir, data, user.id)
+            muammolar, takror, karta = await asyncio.to_thread(tekshir, data, user.id)
         except Exception:
             log.exception("Tekshiruvda xato")
-            muammolar, takror = [], None
+            muammolar, takror, karta = [], None, None
 
         izoh = "; ".join(muammolar)
         if data.get("izoh"):
@@ -724,7 +744,10 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Izoh": rt(izoh),
             "Tranzaksiya ID": rt(data.get("tranzaksiya_id")),
             "Fayl izi": rt(file_hash),
+            "Qabul kartasi": rt(data.get("qabul_kartasi")),
         }
+        if karta:
+            props["Karta"] = {"relation": [{"id": karta["page_id"]}]}
         if data.get("sana"):
             props["Sana"] = {"date": {"start": data["sana"]}}
 
