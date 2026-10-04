@@ -1,0 +1,9 @@
+BOT_TOKEN=yangi botning tokeni (BotFather)
+ANTHROPIC_API_KEY=console.anthropic.com kaliti
+NOTION_TOKEN=Notion integratsiya tokeni
+NOTION_STUDENTS_DB=cd0edb24d8844a22becc82000e915ae4
+NOTION_PAYMENTS_DB=dcbf0d10c519405e887478a857871b70
+NOTION_CARDS_DB=78d60efb27954e97a55a65819fdd0ee3
+ADMIN_CHAT_ID=sizning Telegram ID yoki admin guruh ID
+CLAUDE_MODEL=claude-haiku-4-5-20251001
+TZ=Asia/Tashkent
