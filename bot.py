@@ -594,7 +594,10 @@ async def show_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"`{faol['raqam']}`", parse_mode="MarkdownV2"
     )
     m3 = await update.message.reply_text(
-        "📸 To'lovni amalga oshirgach, chek rasmini shu yerga yuboring."
+        "📄 To'lovni amalga oshirgach, chekni shu yerga yuboring.\n\n"
+        "✅ Eng yaxshisi — bank ilovasidan chekni PDF qilib yuklab, "
+        "shu faylni yuborish. Bunda ma'lumotlar aniq o'qiladi.\n"
+        "📸 Imkoni bo'lmasa, screenshot ham bo'ladi."
     )
 
     context.user_data["karta_msg_ids"] = [m1.message_id, m2.message_id, m3.message_id]
@@ -679,7 +682,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         doc = message.document
         mt = (doc.mime_type or "").lower()
         if mt not in ("application/pdf", "image/jpeg", "image/png", "image/webp"):
-            await message.reply_text("📸 Faqat rasm yoki PDF yuboring.")
+            await message.reply_text("📄 Faqat PDF yoki rasm yuboring.")
             return
         if doc.file_size and doc.file_size > 18 * 1024 * 1024:
             await message.reply_text("📸 Fayl juda katta. Kichikroq rasm yuboring.")
@@ -705,7 +708,8 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if data.get("chek_emas"):
         await kutish.edit_text(
             "❌ Bu to'lov chekiga o'xshamadi\n\n"
-            "📸 Iltimos, to'lov chekining rasmini yuboring."
+            "📄 Iltimos, to'lov chekini yuboring — bank ilovasidan PDF qilib "
+            "yuklang yoki screenshot oling."
         )
         return
 
