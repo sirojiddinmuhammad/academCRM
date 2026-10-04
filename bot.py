@@ -2,10 +2,11 @@
 Academy to'lov boti — talaba chek yuboradi, AI o'qiydi, Notion'ga yoziladi.
 
 Oqim:
-  /start -> ism so'raladi (bir marta) -> "To'lov qilish" tugmasi
-  -> faol karta ko'rsatiladi -> talaba chek yuboradi
-  -> AI o'qiydi -> dublikat tekshiriladi -> Notion'ga yoziladi
+  /start -> ism (bir marta) -> "To'lov qilish" tugmasi -> faol karta
+  -> talaba chek yuboradi -> AI o'qiydi -> tekshiruvlar -> Notion
   -> talabaga tasdiq, shubhali bo'lsa adminga xabar
+
+Karta xabarlari chek kelganda yoki 2 soatdan keyin o'chiriladi.
 """
 
 import asyncio
@@ -15,17 +16,10 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime, timezone, timedelta
 
 import requests
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    Update,
-)
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -50,7 +44,8 @@ ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 TZ = timezone(timedelta(hours=5))
-MAX_CHEK_YOSHI = 30  # kun — bundan eski chek shubhali
+MAX_CHEK_YOSHI = 30          # kun — bundan eski chek shubhali
+KARTA_MUDDATI = 2 * 60 * 60  # soniya — karta xabari shuncha turadi
 
 BTN_TOLOV = "💳 To'lov qilish"
 BTN_TOLOVLARIM = "📋 Mening to'lovlarim"
@@ -59,6 +54,8 @@ MENU = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_TOLOV)], [KeyboardButton(BTN_TOLOVLARIM)]],
     resize_keyboard=True,
 )
+
+RAQAMLAR = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -71,10 +68,13 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-student_cache: dict[int, dict] = {}   # tg_id -> {"page_id":..., "ism":...}
-card_cache: dict = {"vaqt": 0, "faol": None, "eski": []}
+student_cache: dict[int, dict] = {}
 write_lock = asyncio.Lock()
 
+
+# ----------------------------------------------------------------------------
+# Yordamchilar
+# ----------------------------------------------------------------------------
 
 def money(value) -> str:
     if value is None:
@@ -105,6 +105,10 @@ def txt(prop: dict) -> str:
 
 def title_txt(prop: dict) -> str:
     return "".join(p.get("plain_text", "") for p in (prop.get("title") or []))
+
+
+def rt(value):
+    return {"rich_text": [{"text": {"content": str(value)[:1900]}}] if value else []}
 
 
 # ----------------------------------------------------------------------------
@@ -154,10 +158,6 @@ Rules:
 def call_claude(file_bytes: bytes, media_type: str) -> dict:
     b64 = base64.standard_b64encode(file_bytes).decode()
     block_type = "document" if media_type == "application/pdf" else "image"
-    block = {
-        "type": block_type,
-        "source": {"type": "base64", "media_type": media_type, "data": b64},
-    }
 
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -173,7 +173,17 @@ def call_claude(file_bytes: bytes, media_type: str) -> dict:
             "messages": [
                 {
                     "role": "user",
-                    "content": [block, {"type": "text", "text": "Read this receipt."}],
+                    "content": [
+                        {
+                            "type": block_type,
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": "Read this receipt."},
+                    ],
                 }
             ],
         },
@@ -226,6 +236,17 @@ def ncreate(db_id: str, props: dict) -> dict:
     return r.json()
 
 
+def nupdate(page_id: str, props: dict) -> dict:
+    r = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=NOTION_HEADERS,
+        json={"properties": props},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def upload_file(file_bytes: bytes, filename: str, content_type: str) -> str | None:
     try:
         r = requests.post(
@@ -265,16 +286,15 @@ def get_student(tg_id: int) -> dict | None:
     )
     if not rows:
         return None
-    row = rows[0]
-    info = {"page_id": row["id"], "ism": title_txt(row["properties"].get("Ism", {}))}
+    info = {
+        "page_id": rows[0]["id"],
+        "ism": title_txt(rows[0]["properties"].get("Ism", {})),
+    }
     student_cache[tg_id] = info
     return info
 
 
 def create_student(tg_id: int, ism: str, username: str, profil: str) -> dict:
-    def rt(v):
-        return {"rich_text": [{"text": {"content": str(v)[:200]}}] if v else []}
-
     page = ncreate(
         DB_STUDENTS,
         {
@@ -290,13 +310,9 @@ def create_student(tg_id: int, ism: str, username: str, profil: str) -> dict:
 
 
 def get_cards() -> dict:
-    """Faol va eski kartalarni Notion'dan oladi, 5 daqiqa keshlanadi."""
-    if time.time() - card_cache["vaqt"] < 300:
-        return card_cache
-
-    rows = nq(DB_CARDS, limit=50)
+    """Kartalarni har safar Notion'dan o'qiydi — kesh yo'q, o'zgarish darhol ko'rinadi."""
     faol, eski = None, []
-    for row in rows:
+    for row in nq(DB_CARDS, limit=50):
         p = row["properties"]
         karta = {
             "raqam": title_txt(p.get("Karta raqami", {})),
@@ -308,9 +324,7 @@ def get_cards() -> dict:
             faol = karta
         elif holat == "Eski":
             eski.append(karta)
-
-    card_cache.update({"vaqt": time.time(), "faol": faol, "eski": eski})
-    return card_cache
+    return {"faol": faol, "eski": eski}
 
 
 def find_duplicate(file_hash: str, tranzaksiya_id: str | None) -> dict | None:
@@ -332,12 +346,35 @@ def find_duplicate(file_hash: str, tranzaksiya_id: str | None) -> dict | None:
     return None
 
 
+def bir_kunda_takror(tg_id: int, summa, sana: str | None) -> dict | None:
+    """Shu talabadan shu kuni aynan shu summa allaqachon kelganmi?"""
+    if summa is None or not sana:
+        return None
+    rows = nq(
+        DB_PAYMENTS,
+        {
+            "and": [
+                {"property": "Telegram ID", "rich_text": {"equals": str(tg_id)}},
+                {"property": "Summa", "number": {"equals": float(summa)}},
+                {"property": "Sana", "date": {"equals": sana[:10]}},
+            ]
+        },
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
+def izoh_qoshish(page_id: str, eski_izoh: str, qoshimcha: str) -> None:
+    matn = f"{eski_izoh}; {qoshimcha}" if eski_izoh else qoshimcha
+    nupdate(page_id, {"Izoh": rt(matn)})
+
+
 # ----------------------------------------------------------------------------
 # Tekshiruvlar
 # ----------------------------------------------------------------------------
 
-def tekshir(data: dict) -> list[str]:
-    """Shubhali joylar ro'yxati. Bo'sh bo'lsa — hammasi joyida."""
+def tekshir(data: dict, tg_id: int) -> tuple[list[str], dict | None]:
+    """(muammolar ro'yxati, bir kundagi takror yozuv)"""
     muammolar = []
     cards = get_cards()
 
@@ -368,13 +405,43 @@ def tekshir(data: dict) -> list[str]:
     if qabul:
         faol = cards.get("faol")
         if faol and oxirgi4(faol["raqam"]) == qabul:
-            pass  # to'g'ri kartaga tushgan
+            pass
         elif any(oxirgi4(k["raqam"]) == qabul for k in cards.get("eski", [])):
             muammolar.append("eski kartaga to'langan")
         else:
             muammolar.append(f"boshqa kartaga tushgan (...{qabul})")
 
-    return muammolar
+    takror = bir_kunda_takror(tg_id, data.get("summa"), sana)
+    if takror:
+        muammolar.append("shu talabadan bugun aynan shu summa allaqachon kelgan")
+
+    return muammolar, takror
+
+
+# ----------------------------------------------------------------------------
+# Karta xabarlarini boshqarish
+# ----------------------------------------------------------------------------
+
+async def kartani_tozalash(context, chat_id: int, user_data: dict, taskni_bekor=True):
+    for mid in user_data.pop("karta_msg_ids", []):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+    task = user_data.pop("karta_task", None)
+    if task and taskni_bekor:
+        task.cancel()
+
+    user_data.pop("chek_kutilmoqda", None)
+
+
+async def karta_taymeri(context, chat_id: int, user_data: dict):
+    try:
+        await asyncio.sleep(KARTA_MUDDATI)
+    except asyncio.CancelledError:
+        return
+    await kartani_tozalash(context, chat_id, user_data, taskni_bekor=False)
 
 
 # ----------------------------------------------------------------------------
@@ -387,17 +454,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if student:
         await update.message.reply_text(
-            f"Assalomu alaykum, {student['ism']}!\n\n"
-            f"To'lov qilish uchun pastdagi tugmani bosing.",
+            f"👋 Assalomu alaykum, {student['ism']}!\n\n"
+            f"To'lov qilish uchun pastdagi tugmadan foydalaning. 👇",
             reply_markup=MENU,
         )
         return
 
     context.user_data["kutilmoqda"] = "ism"
     await update.message.reply_text(
-        "Assalomu alaykum!\n\n"
-        "Ro'yxatdan o'tish uchun ism va familiyangizni yozing.\n"
-        "Masalan: Aziza Karimova"
+        "👋 Assalomu alaykum!\n\n"
+        "Ro'yxatdan o'tish uchun ism va familiyangizni yozing.\n\n"
+        "✍️ Masalan: Aziza Karimova"
     )
 
 
@@ -414,9 +481,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if context.user_data.get("kutilmoqda") == "ism":
-        if len(matn) < 3 or len(matn) > 60 or not re.search(r"[A-Za-zА-Яа-яЎўҚқҒғҲҳ]{2}", matn):
+        if (
+            len(matn) < 3
+            or len(matn) > 60
+            or not re.search(r"[A-Za-zА-Яа-яЎўҚқҒғҲҳ]{2}", matn)
+        ):
             await update.message.reply_text(
-                "Iltimos, ism va familiyangizni to'liq yozing.\n"
+                "✍️ Iltimos, ism va familiyangizni to'liq yozing.\n\n"
                 "Masalan: Aziza Karimova"
             )
             return
@@ -429,15 +500,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 user.username or "",
                 " ".join(filter(None, [user.first_name, user.last_name])),
             )
-        except Exception as exc:
+        except Exception:
             log.exception("Ro'yxatga yozishda xato")
-            await update.message.reply_text("Xatolik yuz berdi, birozdan keyin urinib ko'ring.")
+            await update.message.reply_text(
+                "⚠️ Xatolik yuz berdi. Iltimos, birozdan keyin qaytadan urinib ko'ring."
+            )
             return
 
         context.user_data.pop("kutilmoqda", None)
         await update.message.reply_text(
-            f"Rahmat, {student['ism']}! Ro'yxatdan o'tdingiz.\n\n"
-            f"To'lov qilish uchun pastdagi tugmani bosing.",
+            f"✅ Rahmat, {student['ism']}!\n\n"
+            f"Ro'yxatdan o'tdingiz. To'lov qilish uchun pastdagi tugmadan "
+            f"foydalaning. 👇",
             reply_markup=MENU,
         )
         return
@@ -446,77 +520,112 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not student:
         context.user_data["kutilmoqda"] = "ism"
         await update.message.reply_text(
-            "Avval ism va familiyangizni yozing.\nMasalan: Aziza Karimova"
+            "✍️ Avval ism va familiyangizni yozing.\n\nMasalan: Aziza Karimova"
         )
         return
 
     await update.message.reply_text(
-        "To'lov qilish uchun pastdagi tugmani bosing.", reply_markup=MENU
+        "👇 To'lov qilish uchun pastdagi tugmadan foydalaning.", reply_markup=MENU
     )
 
 
 async def show_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    student = await asyncio.to_thread(get_student, update.effective_user.id)
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    student = await asyncio.to_thread(get_student, user.id)
     if not student:
         context.user_data["kutilmoqda"] = "ism"
         await update.message.reply_text(
-            "Avval ism va familiyangizni yozing.\nMasalan: Aziza Karimova"
+            "✍️ Avval ism va familiyangizni yozing.\n\nMasalan: Aziza Karimova"
         )
         return
 
-    cards = await asyncio.to_thread(get_cards)
-    faol = cards.get("faol")
+    # oldingi karta xabarlari bo'lsa — o'chiramiz
+    await kartani_tozalash(context, chat_id, context.user_data)
 
-    if not faol:
+    try:
+        cards = await asyncio.to_thread(get_cards)
+    except Exception:
+        log.exception("Kartalarni o'qishda xato")
         await update.message.reply_text(
-            "Hozircha to'lov kartasi mavjud emas. Iltimos, administratorga murojaat qiling."
+            "⚠️ Xatolik yuz berdi. Iltimos, birozdan keyin qaytadan urinib ko'ring."
         )
-        log.error("Kartalar bazasida 'Faol' karta yo'q!")
         return
 
-    satrlar = ["To'lovni quyidagi kartaga amalga oshiring:", ""]
-    if faol["egasi"]:
-        satrlar.append(f"Karta egasi: {faol['egasi']}")
-    if faol["bank"]:
-        satrlar.append(f"Bank: {faol['bank']}")
-    satrlar += ["", "Karta raqami pastda — bosib nusxalashingiz mumkin."]
+    faol = cards.get("faol")
+    if not faol or not faol["raqam"]:
+        log.error("Kartalar bazasida 'Faol' karta yo'q!")
+        await update.message.reply_text(
+            "⚠️ Hozircha to'lov kartasi mavjud emas.\n"
+            "Iltimos, administratorga murojaat qiling."
+        )
+        return
 
-    await update.message.reply_text("\n".join(satrlar))
-    await update.message.reply_text(f"`{faol['raqam']}`", parse_mode="MarkdownV2")
-    await update.message.reply_text(
-        "To'lovni amalga oshirgach, chek rasmini (screenshot) shu yerga yuboring."
+    satrlar = ["💳 To'lov kartasi", ""]
+    if faol["egasi"]:
+        satrlar.append(f"👤 Karta egasi: {faol['egasi']}")
+    if faol["bank"]:
+        satrlar.append(f"🏦 Bank: {faol['bank']}")
+    satrlar += ["", "👇 Raqamni bosib nusxalang"]
+
+    m1 = await update.message.reply_text("\n".join(satrlar))
+    m2 = await update.message.reply_text(
+        f"`{faol['raqam']}`", parse_mode="MarkdownV2"
+    )
+    m3 = await update.message.reply_text(
+        "📸 To'lovni amalga oshirgach, chek rasmini shu yerga yuboring."
+    )
+
+    context.user_data["karta_msg_ids"] = [m1.message_id, m2.message_id, m3.message_id]
+    context.user_data["chek_kutilmoqda"] = True
+    context.user_data["karta_task"] = asyncio.create_task(
+        karta_taymeri(context, chat_id, context.user_data)
     )
 
 
 async def show_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    student = await asyncio.to_thread(get_student, update.effective_user.id)
+    user = update.effective_user
+    student = await asyncio.to_thread(get_student, user.id)
     if not student:
         context.user_data["kutilmoqda"] = "ism"
-        await update.message.reply_text("Avval ism va familiyangizni yozing.")
+        await update.message.reply_text(
+            "✍️ Avval ism va familiyangizni yozing.\n\nMasalan: Aziza Karimova"
+        )
         return
 
-    rows = await asyncio.to_thread(
-        nq,
-        DB_PAYMENTS,
-        {"property": "Telegram ID", "rich_text": {"equals": str(update.effective_user.id)}},
-        [{"property": "Sana", "direction": "ascending"}],
-        100,
-    )
+    try:
+        rows = await asyncio.to_thread(
+            nq,
+            DB_PAYMENTS,
+            {"property": "Telegram ID", "rich_text": {"equals": str(user.id)}},
+            [{"property": "Sana", "direction": "ascending"}],
+            100,
+        )
+    except Exception:
+        log.exception("To'lovlarni o'qishda xato")
+        await update.message.reply_text("⚠️ Xatolik yuz berdi. Keyinroq urinib ko'ring.")
+        return
 
     if not rows:
-        await update.message.reply_text("Hozircha to'lovlaringiz yo'q.", reply_markup=MENU)
+        await update.message.reply_text(
+            "📋 Hozircha to'lovlaringiz yo'q.", reply_markup=MENU
+        )
         return
 
     satrlar, jami = [], 0.0
-    for i, row in enumerate(rows, 1):
+    for i, row in enumerate(rows):
         p = row["properties"]
         summa = p.get("Summa", {}).get("number")
         sana = (p.get("Sana", {}).get("date") or {}).get("start")
         jami += summa or 0
-        satrlar.append(f"{i}. {money(summa)} so'm — {sana_matn(sana)}")
+        belgi = RAQAMLAR[i] if i < len(RAQAMLAR) else f"{i + 1}."
+        satrlar.append(f"{belgi} {money(summa)} so'm — {sana_matn(sana)}")
 
     await update.message.reply_text(
-        "To'lovlaringiz:\n\n" + "\n".join(satrlar) + f"\n\nJami: {money(jami)} so'm",
+        "📋 Sizning to'lovlaringiz\n\n"
+        + "\n".join(satrlar)
+        + f"\n\n💰 Jami: {money(jami)} so'm",
         reply_markup=MENU,
     )
 
@@ -524,16 +633,24 @@ async def show_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     message = update.message
+    chat_id = update.effective_chat.id
 
     student = await asyncio.to_thread(get_student, user.id)
     if not student:
         context.user_data["kutilmoqda"] = "ism"
         await message.reply_text(
-            "Avval ism va familiyangizni yozing.\nMasalan: Aziza Karimova"
+            "✍️ Avval ism va familiyangizni yozing.\n\nMasalan: Aziza Karimova"
         )
         return
 
-    # --- faylni olish ---
+    if not context.user_data.get("chek_kutilmoqda"):
+        await message.reply_text(
+            "💳 Avval \"To'lov qilish\" tugmasini bosing, keyin chekni yuboring. 👇",
+            reply_markup=MENU,
+        )
+        return
+
+    # --- fayl ---
     if message.photo:
         tg_file = await context.bot.get_file(message.photo[-1].file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -542,30 +659,33 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         doc = message.document
         mt = (doc.mime_type or "").lower()
         if mt not in ("application/pdf", "image/jpeg", "image/png", "image/webp"):
-            await message.reply_text("Faqat rasm yoki PDF yuboring.")
+            await message.reply_text("📸 Faqat rasm yoki PDF yuboring.")
             return
         if doc.file_size and doc.file_size > 18 * 1024 * 1024:
-            await message.reply_text("Fayl juda katta. Kichikroq rasm yuboring.")
+            await message.reply_text("📸 Fayl juda katta. Kichikroq rasm yuboring.")
             return
         tg_file = await context.bot.get_file(doc.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
         media_type = mt
         filename = doc.file_name or f"chek_{message.message_id}"
 
-    kutish = await message.reply_text("Chek tekshirilmoqda...")
+    kutish = await message.reply_text("⏳ Chekingiz tekshirilmoqda...")
 
     try:
         data = await asyncio.to_thread(call_claude, file_bytes, media_type)
-    except Exception as exc:
+    except Exception:
         log.exception("AI xatosi")
-        await kutish.edit_text("Chekni o'qib bo'lmadi. Iltimos, qaytadan yuboring.")
+        await kutish.edit_text(
+            "⚠️ Chekni o'qib bo'lmadi.\n\nIltimos, qaytadan yuboring."
+        )
         return
 
     log.info("Transkript (%s): %s", student["ism"], data.get("_transkript", "")[:400])
 
     if data.get("chek_emas"):
         await kutish.edit_text(
-            "Bu to'lov chekiga o'xshamadi. Iltimos, chek screenshotini yuboring."
+            "❌ Bu to'lov chekiga o'xshamadi\n\n"
+            "📸 Iltimos, to'lov chekining rasmini yuboring."
         )
         return
 
@@ -582,18 +702,19 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         if duplicate:
             await kutish.edit_text(
-                "Bu chek avval yuborilgan. Yangi to'lov uchun yangi chek yuboring."
+                "♻️ Bu chek avval yuborilgan\n\nYangi to'lov uchun yangi chek yuboring."
             )
             return
 
-        muammolar = await asyncio.to_thread(tekshir, data)
+        try:
+            muammolar, takror = await asyncio.to_thread(tekshir, data, user.id)
+        except Exception:
+            log.exception("Tekshiruvda xato")
+            muammolar, takror = [], None
 
         izoh = "; ".join(muammolar)
         if data.get("izoh"):
             izoh = f"{izoh}; {data['izoh']}" if izoh else data["izoh"]
-
-        def rt(v):
-            return {"rich_text": [{"text": {"content": str(v)[:1900]}}] if v else []}
 
         props = {
             "Ism": {"title": [{"text": {"content": student["ism"][:200]}}]},
@@ -604,45 +725,66 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Tranzaksiya ID": rt(data.get("tranzaksiya_id")),
             "Fayl izi": rt(file_hash),
         }
-
         if data.get("sana"):
             props["Sana"] = {"date": {"start": data["sana"]}}
 
-        upload_id = await asyncio.to_thread(upload_file, file_bytes, filename, media_type)
+        upload_id = await asyncio.to_thread(
+            upload_file, file_bytes, filename, media_type
+        )
         if upload_id:
             props["Chek"] = {
                 "files": [
-                    {"type": "file_upload", "file_upload": {"id": upload_id}, "name": filename}
+                    {
+                        "type": "file_upload",
+                        "file_upload": {"id": upload_id},
+                        "name": filename,
+                    }
                 ]
             }
 
         try:
             await asyncio.to_thread(ncreate, DB_PAYMENTS, props)
-        except Exception as exc:
+        except Exception:
             log.exception("Notion yozishda xato")
             await kutish.edit_text(
-                "Xatolik yuz berdi. Iltimos, birozdan keyin qaytadan yuboring."
+                "⚠️ Xatolik yuz berdi.\n\nIltimos, birozdan keyin qaytadan yuboring."
             )
             return
 
-    # --- talabaga javob ---
+        # takroriy bo'lsa — eski yozuvga ham eslatma
+        if takror:
+            try:
+                await asyncio.to_thread(
+                    izoh_qoshish,
+                    takror["id"],
+                    txt(takror["properties"].get("Izoh", {})),
+                    "shu kuni shu summa ikkinchi marta kelgan",
+                )
+            except Exception:
+                log.exception("Eski yozuvga izoh yozilmadi")
+
+    # --- karta xabarlarini o'chirish ---
+    await kartani_tozalash(context, chat_id, context.user_data)
+
     await kutish.edit_text(
-        f"✅ To'lovingiz qabul qilindi\n"
-        f"{money(data.get('summa'))} so'm — {sana_matn(data.get('sana'))}"
+        f"✅ To'lovingiz qabul qilindi!\n\n"
+        f"💰 {money(data.get('summa'))} so'm\n"
+        f"📅 {sana_matn(data.get('sana'))}\n\n"
+        f"Rahmat! 🌟"
     )
 
     # --- adminga xabar ---
     if muammolar:
         try:
+            nik = f" (@{user.username})" if user.username else ""
             await context.bot.send_message(
                 ADMIN_CHAT_ID,
                 f"⚠️ Tekshirish kerak\n\n"
-                f"O'quvchi: {student['ism']}"
-                + (f" (@{user.username})" if user.username else "")
-                + f"\nSumma: {money(data.get('summa'))} so'm\n"
-                f"Sana: {sana_matn(data.get('sana'))}\n"
-                f"Bank: {data.get('bank') or '—'}\n"
-                f"Sabab: {', '.join(muammolar)}",
+                f"👤 O'quvchi: {student['ism']}{nik}\n"
+                f"💰 Summa: {money(data.get('summa'))} so'm\n"
+                f"📅 Sana: {sana_matn(data.get('sana'))}\n"
+                f"🏦 Bank: {data.get('bank') or '—'}\n\n"
+                f"❗️ Sabab: {', '.join(muammolar)}",
             )
             if message.photo:
                 await context.bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id)
@@ -669,9 +811,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.ALL, on_receipt)
-    )
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_receipt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("To'lov boti ishga tushdi")
