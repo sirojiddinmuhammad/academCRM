@@ -79,6 +79,11 @@ ADMIN_USER_ID = int(
     os.environ.get("ADMIN_USER_ID", ADMIN_CHAT_ID if ADMIN_CHAT_ID > 0 else 0)
 )
 
+# Xodimlar guruhi. Qo'yilsa — har bir to'lov hisoboti shu yerga boradi, adminga
+# esa faqat shubhali cheklar va xodimlar kiritgan o'zgarishlar yetib keladi.
+XODIM_CHAT_ID = int(os.environ.get("XODIM_CHAT_ID", "0") or 0)
+HISOBOT_CHAT_ID = XODIM_CHAT_ID or ADMIN_CHAT_ID
+
 student_cache: dict[int, dict] = {}
 write_lock = asyncio.Lock()
 karta_navbat = {"n": 0}  # bir nechta faol karta bo'lsa — navbat bilan ko'rsatish
@@ -848,45 +853,82 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ),
     )
 
-    # --- adminga hisobot (har bir to'lov) ---
-    try:
-        nik = f" (@{user.username})" if user.username else ""
-        karta_matn = (
-            f"{karta['bank'] or 'karta'} ...{oxirgi4(karta['raqam'])}"
-            if karta
-            else (data.get("qabul_kartasi") or "—")
-        )
-        sarlavha = "⚠️ Yangi to'lov — tekshirish kerak" if muammolar else "✅ Yangi to'lov"
-        matn = (
-            f"{sarlavha}\n\n"
-            f"👤 O'quvchi: {student['ism']}{nik}\n"
-            f"💰 Summa: {money(data.get('summa'))} so'm\n"
-            f"📅 Sana: {sana_matn(data.get('sana'))}\n"
-            f"🏦 Bank: {data.get('bank') or '—'}\n"
-            f"💳 Karta: {karta_matn}"
-        )
-        if data.get("komissiya"):
-            matn += f"\n🧾 Komissiya: {money(data['komissiya'])} so'm"
-        if muammolar:
-            matn += f"\n\n❗️ Sabab: {', '.join(muammolar)}"
+    # --- hisobot: xodimlar guruhiga (yoki guruh bo'lmasa — adminga) ---
+    nik = f" (@{user.username})" if user.username else ""
+    karta_matn = (
+        f"{karta['bank'] or 'karta'} ...{oxirgi4(karta['raqam'])}"
+        if karta
+        else (data.get("qabul_kartasi") or "—")
+    )
+    shubhali = bool(muammolar)
+    sarlavha = "⚠️ Yangi to'lov — tekshirish kerak" if shubhali else "✅ Yangi to'lov"
+    matn = (
+        f"{sarlavha}\n\n"
+        f"👤 O'quvchi: {student['ism']}{nik}\n"
+        f"💰 Summa: {money(data.get('summa'))} so'm\n"
+        f"📅 Sana: {sana_matn(data.get('sana'))}\n"
+        f"🏦 Bank: {data.get('bank') or '—'}\n"
+        f"💳 Karta: {karta_matn}"
+    )
+    if data.get("komissiya"):
+        matn += f"\n🧾 Komissiya: {money(data['komissiya'])} so'm"
+    if muammolar:
+        matn += f"\n\n❗️ Sabab: {', '.join(muammolar)}"
 
-        await context.bot.send_message(
-            ADMIN_CHAT_ID,
-            matn,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✏️ Summani o'zgartirish", callback_data=f"a:{pid}"
-                        )
-                    ]
-                ]
-            ),
-        )
+    bayroq = "1" if shubhali else "0"
+    tugmalar = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Tekshirildi", callback_data=f"v:{pid}:{bayroq}"),
+                InlineKeyboardButton(
+                    "✏️ Summani o'zgartirish", callback_data=f"a:{pid}:{bayroq}"
+                ),
+            ]
+        ]
+    )
+
+    try:
+        await context.bot.send_message(HISOBOT_CHAT_ID, matn, reply_markup=tugmalar)
         if message.photo:
-            await context.bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id)
+            await context.bot.send_photo(HISOBOT_CHAT_ID, message.photo[-1].file_id)
         elif message.document:
-            await context.bot.send_document(ADMIN_CHAT_ID, message.document.file_id)
+            await context.bot.send_document(HISOBOT_CHAT_ID, message.document.file_id)
+    except Exception:
+        log.exception("Hisobot yuborilmadi")
+
+    # shubhali bo'lsa — adminga ham nusxa (xodimlar guruhi alohida bo'lsa)
+    if shubhali and XODIM_CHAT_ID and ADMIN_CHAT_ID != XODIM_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                ADMIN_CHAT_ID, matn + "\n\n(nusxa — xodimlar guruhiga ham yuborildi)"
+            )
+        except Exception:
+            log.exception("Adminga nusxa yuborilmadi")
+
+
+def kim(user) -> str:
+    """Tugmani bosgan odamning ko'rinadigan nomi."""
+    ism = " ".join(filter(None, [user.first_name, user.last_name])) or str(user.id)
+    return f"{ism} (@{user.username})" if user.username else ism
+
+
+def xodimmi(query) -> bool:
+    """Tugmani bosishga ruxsat bormi: admin yoki xodimlar guruhidagi odam."""
+    if ADMIN_USER_ID and query.from_user.id == ADMIN_USER_ID:
+        return True
+    if XODIM_CHAT_ID and query.message and query.message.chat_id == XODIM_CHAT_ID:
+        return True
+    if not ADMIN_USER_ID and not XODIM_CHAT_ID:
+        return True
+    return False
+
+
+async def adminga_xabar(context, qayerdan_chat_id: int, matn: str) -> None:
+    """Xodimlar guruhida qilingan ishni adminga bildiradi."""
+    if not XODIM_CHAT_ID or qayerdan_chat_id != XODIM_CHAT_ID:
+        return  # ish adminning o'zida bo'lgan — takror xabar kerak emas
+    try:
+        await context.bot.send_message(ADMIN_CHAT_ID, matn[:4000])
     except Exception:
         log.exception("Adminga xabar yuborilmadi")
 
@@ -907,21 +949,59 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # --- admin: to'g'ridan-to'g'ri tahrir ---
+    # --- xodim yoki admin: summani to'g'rilash ---
     if amal == "a":
-        if ADMIN_USER_ID and user.id != ADMIN_USER_ID:
+        if not xodimmi(query):
             await query.answer("Sizda ruxsat yo'q", show_alert=True)
             return
-        context.user_data["admin_tuzatish"] = qolgan
+        page_id, _, bayroq = qolgan.partition(":")
+        context.user_data["admin_tuzatish"] = {
+            "page_id": page_id,
+            "shubhali": bayroq == "1",
+            "chat_id": query.message.chat_id,
+            "message_id": query.message.message_id,
+            "matn": query.message.text or "",
+        }
         await query.answer()
         await query.message.reply_text(
             "✏️ Yangi summani yozing (faqat raqam).\n\nBekor qilish uchun: /bekor"
         )
         return
 
-    # --- admin: talaba so'rovini tasdiqlash yoki rad etish ---
+    # --- xodim yoki admin: tekshirildi ---
+    if amal == "v":
+        if not xodimmi(query):
+            await query.answer("Sizda ruxsat yo'q", show_alert=True)
+            return
+
+        page_id, _, bayroq = qolgan.partition(":")
+        ism = kim(user)
+        try:
+            await asyncio.to_thread(
+                nupdate,
+                page_id,
+                {"Tekshirildi": {"checkbox": True}, "Kim tekshirdi": rt(ism)},
+            )
+        except Exception as exc:
+            await query.answer(f"Xato: {exc}"[:180], show_alert=True)
+            return
+
+        await query.answer("Belgilandi")
+        await query.edit_message_text((query.message.text or "") + f"\n\n✅ {ism} tekshirdi")
+
+        if bayroq == "1":
+            await adminga_xabar(
+                context,
+                query.message.chat_id,
+                f"✅ Shubhali chek tekshirildi\n\n"
+                f"👤 Xodim: {ism}\n\n"
+                f"{query.message.text or ''}",
+            )
+        return
+
+    # --- talaba so'rovini tasdiqlash yoki rad etish ---
     if amal in ("ok", "no"):
-        if ADMIN_USER_ID and user.id != ADMIN_USER_ID:
+        if not xodimmi(query):
             await query.answer("Sizda ruxsat yo'q", show_alert=True)
             return
 
@@ -930,9 +1010,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("So'rov topilmadi yoki allaqachon hal qilingan", show_alert=True)
             return
 
+        ism = kim(user)
+
         if amal == "no":
             await query.answer("Rad etildi")
-            await query.edit_message_text((query.message.text or "") + "\n\n❌ Rad etildi")
+            await query.edit_message_text(
+                (query.message.text or "") + f"\n\n❌ {ism} rad etdi"
+            )
+            await adminga_xabar(
+                context,
+                query.message.chat_id,
+                f"❌ Talaba so'rovi rad etildi\n\n"
+                f"👤 Xodim: {ism}\n\n{query.message.text or ''}",
+            )
             try:
                 await context.bot.send_message(
                     sorov["chat_id"],
@@ -945,7 +1035,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
             await asyncio.to_thread(
-                summani_yangilash, sorov["page_id"], sorov["yangi"], "talaba so'rovi"
+                summani_yangilash,
+                sorov["page_id"],
+                sorov["yangi"],
+                f"talaba so'rovi, tasdiqladi: {ism}",
             )
         except Exception as exc:
             await query.answer(f"Xato: {exc}"[:180], show_alert=True)
@@ -953,7 +1046,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         await query.answer("Tasdiqlandi")
-        await query.edit_message_text((query.message.text or "") + "\n\n✅ Tasdiqlandi")
+        await query.edit_message_text(
+            (query.message.text or "") + f"\n\n✅ {ism} tasdiqladi"
+        )
+        await adminga_xabar(
+            context,
+            query.message.chat_id,
+            f"✅ Talaba so'rovi tasdiqlandi\n\n"
+            f"👤 Xodim: {ism}\n"
+            f"💰 Yangi summa: {money(sorov['yangi'])} so'm\n\n{query.message.text or ''}",
+        )
         try:
             await context.bot.send_message(
                 sorov["chat_id"],
@@ -967,19 +1069,55 @@ async def tuzatishni_qabul_qilish(update, context, matn: str) -> bool:
     """Tuzatish rejimidagi matnni qayta ishlaydi. True — matn ishlatildi."""
     user = update.effective_user
 
-    page_id = context.user_data.get("admin_tuzatish")
-    if page_id:
+    holat = context.user_data.get("admin_tuzatish")
+    if holat:
         raqam = re.sub(r"\D", "", matn)
         if not raqam:
             await update.message.reply_text("Faqat raqam yozing. Masalan: 450000")
             return True
+
+        ism = kim(user)
+        yangi = int(raqam)
         try:
-            await asyncio.to_thread(summani_yangilash, page_id, int(raqam), "admin")
+            await asyncio.to_thread(summani_yangilash, holat["page_id"], yangi, ism)
         except Exception as exc:
             await update.message.reply_text(f"⚠️ Yangilab bo'lmadi: {exc}")
             return True
+
         context.user_data.pop("admin_tuzatish", None)
-        await update.message.reply_text(f"✅ Summa yangilandi: {money(int(raqam))} so'm")
+        await update.message.reply_text(f"✅ Summa yangilandi: {money(yangi)} so'm")
+
+        # hisobot xabarini yangilaymiz — kim o'zgartirgani ko'rinib tursin
+        yangi_matn = (
+            f"{holat['matn']}\n\n✏️ {ism} o'zgartirdi: {money(yangi)} so'm"
+        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=holat["chat_id"],
+                message_id=holat["message_id"],
+                text=yangi_matn[:4000],
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ Tekshirildi",
+                                callback_data=f"v:{holat['page_id']}:"
+                                f"{'1' if holat['shubhali'] else '0'}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+        except Exception:
+            log.exception("Hisobot xabari yangilanmadi")
+
+        await adminga_xabar(
+            context,
+            holat["chat_id"],
+            f"✏️ Summa o'zgartirildi\n\n"
+            f"👤 Xodim: {ism}\n"
+            f"💰 Yangi summa: {money(yangi)} so'm\n\n{holat['matn']}",
+        )
         return True
 
     page_id = context.user_data.get("tuzatish")
@@ -1006,14 +1144,13 @@ async def tuzatishni_qabul_qilish(update, context, matn: str) -> bool:
         context.user_data.pop("tuzatish", None)
 
         await update.message.reply_text(
-            "📨 So'rovingiz yuborildi.\n\n"
-            "Administrator tekshirib tasdiqlagach, sizga xabar beramiz."
+            "📨 So'rovingiz yuborildi.\n\nTekshirib tasdiqlangach, sizga xabar beramiz."
         )
 
         nik = f" (@{user.username})" if user.username else ""
         try:
             await context.bot.send_message(
-                ADMIN_CHAT_ID,
+                HISOBOT_CHAT_ID,
                 f"✏️ Summani tuzatish so'rovi\n\n"
                 f"👤 {student['ism'] if student else user.id}{nik}\n"
                 f"🤖 AI o'qigan: {money(eski)} so'm\n"
@@ -1028,7 +1165,7 @@ async def tuzatishni_qabul_qilish(update, context, matn: str) -> bool:
                 ),
             )
         except Exception:
-            log.exception("Adminga so'rov yuborilmadi")
+            log.exception("So'rov yuborilmadi")
         return True
 
     return False
