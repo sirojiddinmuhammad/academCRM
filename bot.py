@@ -117,6 +117,32 @@ def oxirgi4(karta: str | None) -> str:
     return raqamlar[-4:] if len(raqamlar) >= 4 else ""
 
 
+def notion_sana(iso: str | None) -> dict | None:
+    """
+    Notion uchun date property. Chekdagi vaqt Toshkent vaqti hisoblanadi.
+
+    Notion qoidasi: time_zone berilsa, start ichida UTC siljishi (+05:00 yoki Z)
+    bo'lmasligi kerak. Sana vaqtsiz bo'lsa — time_zone umuman berilmaydi.
+    """
+    if not iso:
+        return None
+
+    matn = iso.strip()
+    if "T" not in matn:
+        return {"start": matn[:10]}  # faqat sana — vaqt mintaqasi ma'nosiz
+
+    # mavjud siljishni olib tashlaymiz: AI "Z" yoki "+05:00" qo'shib yuborishi mumkin
+    sana_qism, _, vaqt_qism = matn.partition("T")
+    vaqt_qism = re.split(r"[Zz+]|(?<=\d)-(?=\d\d:)", vaqt_qism)[0]
+
+    bolak = vaqt_qism.split(":")
+    while len(bolak) < 3:
+        bolak.append("00")
+    vaqt = ":".join(b.zfill(2)[:2] for b in bolak[:3])
+
+    return {"start": f"{sana_qism[:10]}T{vaqt}", "time_zone": "Asia/Tashkent"}
+
+
 def txt(prop: dict) -> str:
     return "".join(p.get("plain_text", "") for p in (prop.get("rich_text") or []))
 
@@ -798,8 +824,9 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         }
         if karta:
             props["Karta"] = {"relation": [{"id": karta["page_id"]}]}
-        if data.get("sana"):
-            props["Sana"] = {"date": {"start": data["sana"]}}
+        sana_prop = notion_sana(data.get("sana"))
+        if sana_prop:
+            props["Sana"] = {"date": sana_prop}
 
         upload_id = await asyncio.to_thread(
             upload_file, file_bytes, filename, media_type
